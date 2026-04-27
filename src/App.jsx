@@ -82,80 +82,15 @@ function mergeOcrResults(results = []) {
   return merged;
 }
 
-// ─── Claude Vision OCR ─────────────────────────────────────────────────────
+// ─── Claude Vision OCR — image fetched server-side via proxy ───────────────
 async function ocrDocument(url, docType = "id_proof") {
   if (!url || url.trim() === "") return null;
-
-  // fetch image → base64
-  let base64, mimeType;
   try {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const blob = await res.blob();
-    mimeType = blob.type || "image/jpeg";
-    // ensure it's an image mime
-    if (!mimeType.startsWith("image/") && mimeType !== "application/pdf") {
-      mimeType = url.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg";
-    }
-    const buf = await blob.arrayBuffer();
-    // chunk-based base64 to avoid call stack overflow on large files
-    const bytes = new Uint8Array(buf);
-    let binary = "";
-    const chunkSize = 8192;
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-      binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-    }
-    base64 = btoa(binary);
-  } catch (e) {
-    return { error: `Could not fetch document: ${e.message}` };
-  }
-
-  const prompts = {
-    id_proof: `You are an OCR engine for KYC verification. Extract information from this ID document.
-Return ONLY valid JSON (no markdown, no extra text):
-{
-  "document_type": "Aadhaar|PAN|Voter ID|Driving License|Passport|Ration Card|Birth Certificate|Other",
-  "document_number": "extracted number or null",
-  "full_name": "full name as printed on document or null",
-  "date_of_birth": "DOB if visible or null",
-  "additional_info": "any other relevant text (address, validity, etc.) or null"
-}`,
-    relationship_proof: `You are an OCR engine for KYC verification. Extract information from this relationship proof document.
-Return ONLY valid JSON (no markdown, no extra text):
-{
-  "document_type": "Birth Certificate|Ration Card|SSLC Marks Card|Marriage Certificate|Passport|Other",
-  "names_found": ["list","of","all","names","visible","in","document"],
-  "relationship_mentioned": "relationship if explicitly stated or null",
-  "beneficiary_name": "name identified as beneficiary/patient/child if determinable or null",
-  "recipient_name": "name identified as parent/guardian/relative if determinable or null",
-  "additional_info": "any other relevant text or null"
-}`,
-    pan_proof: `You are an OCR engine for KYC verification. Extract information from this PAN card.
-Return ONLY valid JSON (no markdown, no extra text):
-{
-  "document_type": "PAN",
-  "pan_number": "10-character PAN number or null",
-  "full_name": "name as printed on PAN or null",
-  "father_name": "father's name if visible or null",
-  "date_of_birth": "DOB if visible or null"
-}`,
-  };
-
-  try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    // Pass URL to Vercel proxy — server fetches image, no browser CORS issues
+    const response = await fetch("/api/claude", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1000,
-        messages: [{
-          role: "user",
-          content: [
-            { type: "image", source: { type: "base64", media_type: mimeType, data: base64 } },
-            { type: "text", text: prompts[docType] || prompts.id_proof }
-          ]
-        }]
-      })
+      body: JSON.stringify({ imageUrl: url, docType })
     });
     const data = await response.json();
     const text = data.content?.find(b => b.type === "text")?.text || "";
