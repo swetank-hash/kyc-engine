@@ -60,44 +60,54 @@ function parseCurrency(raw = "") {
   return "INR";
 }
 
-// ─── Split comma-separated URLs ────────────────────────────────────────────
-function splitUrls(raw = "") {
-  return raw.split(/\s*,\s*/).map(u => u.trim()).filter(u => u.startsWith("http"));
-}
+// ─── Parse pre-computed OCR data from CSV column ──────────────────────────
+// The CSV has id_proof_ocr_data and relationship_proof_ocr_data columns
+// Each cell contains one or more JSON objects like:
+// {"name":"Ravi Kumar","side":"front","document_id":"3767 9545 0671","document_type":"Aadhaar Card"}
+// Multiple docs are separated by } , { — we parse all and merge names
 
-// ─── Merge multiple OCR results into one ───────────────────────────────────
-function mergeOcrResults(results = []) {
-  if (!results.length) return null;
-  const valid = results.filter(r => r && !r.error);
-  if (!valid.length) return results[0];
-  const merged = { ...valid[0] };
-  const allNames = valid.flatMap(r => r.names_found || (r.full_name ? [r.full_name] : []));
-  if (allNames.length) merged.names_found = [...new Set(allNames)];
-  for (const r of valid) {
-    for (const [k, v] of Object.entries(r)) {
-      if (!merged[k] && v) merged[k] = v;
-    }
-  }
-  merged._sources = results.length;
-  return merged;
-}
-
-// ─── Claude Vision OCR — image fetched server-side via proxy ───────────────
-async function ocrDocument(url, docType = "id_proof") {
-  if (!url || url.trim() === "") return null;
+function parseOcrColumn(raw = "") {
+  if (!raw || raw.trim() === "") return null;
   try {
-    // Pass URL to Vercel proxy — server fetches image, no browser CORS issues
-    const response = await fetch("/api/claude", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ imageUrl: url, docType })
-    });
-    const data = await response.json();
-    const text = data.content?.find(b => b.type === "text")?.text || "";
-    const clean = text.replace(/```json|```/g,"").trim();
-    return JSON.parse(clean);
+    // Split on boundaries between JSON objects: "} ," or "},"  followed by "{"
+    // Wrap in array and parse
+    const cleaned = raw.trim();
+    const asArray = cleaned.startsWith("[") ? cleaned : `[${cleaned}]`;
+    // Fix common issues: trailing commas, unquoted values
+    const fixed = asArray
+      .replace(/,\s*}/g, "}")      // trailing commas in objects
+      .replace(/,\s*]/g, "]");     // trailing commas in arrays
+    const entries = JSON.parse(fixed);
+    if (!Array.isArray(entries) || entries.length === 0) return null;
+
+    // Merge all entries — collect all names, take first non-null for each field
+    const merged = {};
+    const allNames = [];
+
+    for (const entry of entries) {
+      if (entry.name) allNames.push(entry.name);
+      for (const [k, v] of Object.entries(entry)) {
+        if (v && !merged[k]) merged[k] = v;
+      }
+    }
+
+    // Normalise field names to what the KYC engine expects
+    return {
+      full_name:       merged.name || null,
+      document_type:   merged.document_type || null,
+      document_number: merged.document_id || merged.document_number || null,
+      names_found:     [...new Set(allNames.filter(Boolean))],
+      _raw_entries:    entries,
+    };
   } catch (e) {
-    return { error: `OCR failed: ${e.message}` };
+    // Try extracting just names with regex as fallback
+    const names = [];
+    const nameMatches = raw.matchAll(/"name"\s*:\s*"([^"]+)"/g);
+    for (const m of nameMatches) { if (m[1] && m[1] !== "null") names.push(m[1]); }
+    if (names.length > 0) {
+      return { full_name: names[0], names_found: [...new Set(names)], _parse_error: e.message };
+    }
+    return { error: `Could not parse OCR data: ${e.message}` };
   }
 }
 
@@ -126,14 +136,18 @@ function runKYC(row, ocrResults = {}) {
   const isIndiv    = INDIV.includes(rt);
 
   // OCR results
-  const idOCR  = ocrResults.id_proof  || null;
-  const relOCR = ocrResults.rel_proof || null;
-
   // Column name aliases — support both naming conventions from real CSV
   if (!row.id_proof_url && row.id_proof_link)             row.id_proof_url = row.id_proof_link;
   if (!row.relationship_proof_url && row.relationship_proof_link) row.relationship_proof_url = row.relationship_proof_link;
   if (!row.account_holder_name && row.name_as_in_bank)    row.account_holder_name = row.name_as_in_bank;
-  if (!row.gst_status && row.gstin_valid)                 row.gst_status = row.gstin_valid === "true" || row.gstin_valid === "1" ? "VALID" : row.gstin_valid.toUpperCase();
+  if (!row.gst_status && row.gstin_valid)                 row.gst_status = row.gstin_valid === "true" || row.gstin_valid === "1" ? "VALID" : (row.gstin_valid || "").toUpperCase();
+
+  // Use pre-computed OCR data from CSV columns if available
+  // Falls back to runtime OCR results (ocrResults) if CSV OCR not present
+  const idOCR  = (row.id_proof_ocr_data   ? parseOcrColumn(row.id_proof_ocr_data)           : null)
+              || ocrResults.id_proof  || null;
+  const relOCR = (row.relationship_proof_ocr_data ? parseOcrColumn(row.relationship_proof_ocr_data) : null)
+              || ocrResults.rel_proof || null;
 
   // 1. Account Status
   if (["VERIFIED","VALID"].includes(acctStatus)) {
@@ -195,7 +209,7 @@ function runKYC(row, ocrResults = {}) {
       checks.push({ id:"id", label:"ID Proof (Individual)", status:"hold", detail:"No ID proof URL provided in CSV. Add id_proof_url column with the document URL." });
       flag("HOLD");
     } else if (idOCR?.error) {
-      checks.push({ id:"id", label:"ID Proof (Individual)", status:"hold", detail:`OCR failed: ${idOCR.error}. Manual review required.` });
+      checks.push({ id:"id", label:"ID Proof (Individual)", status:"hold", detail:`ID proof error: ${idOCR.error}. Manual review required.` });
       flag("HOLD");
     } else if (idOCR?.full_name) {
       const nameToCheck = rt==="myself" ? (coName||nameUser) : (recipName||nameUser);
@@ -203,17 +217,17 @@ function runKYC(row, ocrResults = {}) {
       const benMatch    = benefName && fuzzyNameMatch(idOCR.full_name, benefName);
       if (idMatch || benMatch) {
         checks.push({ id:"id", label:"ID Proof (Individual)", status:"pass",
-          detail:`OCR: ${idOCR.document_type||"Document"}${idOCR.document_number?` (${idOCR.document_number})`:""}. Extracted name "${idOCR.full_name}" matches recipient/beneficiary.` });
+          detail:`${idOCR.document_type||"Document"}${idOCR.document_number?` (${idOCR.document_number})`:""}. Extracted name "${idOCR.full_name}" matches recipient/beneficiary.` });
       } else {
         checks.push({ id:"id", label:"ID Proof (Individual)", status:"reject",
-          detail:`OCR extracted name "${idOCR.full_name}" doesn't match recipient "${nameToCheck}" or beneficiary "${benefName}". Align the recipient name with the document.` });
+          detail:`Extracted name "${idOCR.full_name}" doesn't match recipient "${nameToCheck}" or beneficiary "${benefName}". Align the recipient name with the document.` });
         flag("REJECT");
       }
     } else if (idOCR) {
-      checks.push({ id:"id", label:"ID Proof (Individual)", status:"hold", detail:"OCR could not extract a name from the document. Manual review required." });
+      checks.push({ id:"id", label:"ID Proof (Individual)", status:"hold", detail:"Could not extract a name from the ID document. Manual review required." });
       flag("HOLD");
     } else {
-      checks.push({ id:"id", label:"ID Proof (Individual)", status:"hold", detail:"Processing OCR..." });
+      checks.push({ id:"id", label:"ID Proof (Individual)", status:"hold", detail:"ID proof data not available. Manual review required." });
       flag("HOLD");
     }
   }
@@ -245,7 +259,7 @@ function runKYC(row, ocrResults = {}) {
         flag("HOLD");
       }
     } else {
-      checks.push({ id:"pan", label:"PAN Verification (Org)", status:"hold", detail:"PAN document processing. Manual review if OCR unavailable." });
+      checks.push({ id:"pan", label:"PAN Verification (Org)", status:"hold", detail:"PAN document data not available. Manual review required." });
       flag("HOLD");
     }
   }
@@ -270,7 +284,7 @@ function runKYC(row, ocrResults = {}) {
       checks.push({ id:"rel", label:"Relationship Proof", status:"hold", detail:"No relationship proof URL in CSV. Add relationship_proof_url column." });
       flag("HOLD");
     } else if (relOCR?.error) {
-      checks.push({ id:"rel", label:"Relationship Proof", status:"hold", detail:`Relationship proof OCR failed: ${relOCR.error}. Manual review required.` });
+      checks.push({ id:"rel", label:"Relationship Proof", status:"hold", detail:`Relationship proof error: ${relOCR.error}. Manual review required.` });
       flag("HOLD");
     } else if (relOCR?.names_found) {
       const names   = relOCR.names_found || [];
@@ -412,35 +426,7 @@ function CheckRow({ check }) {
   );
 }
 
-function OcrDocView({ label, ocrData, status }) {
-  if (!ocrData) return null;
-  const isErr = !!ocrData.error;
-  return (
-    <div style={{ background:"#080f1e", border:`1px solid ${isErr?"#3f1515":"#0f1e35"}`, borderRadius:5, padding:"10px 12px", marginBottom:8 }}>
-      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
-        <span style={{ fontSize:10, color:"#475569", textTransform:"uppercase", letterSpacing:"0.08em" }}>{label}</span>
-        {!isErr && <span style={{ fontSize:10, color:"#34d399", background:"#011a10", border:"1px solid #065f46", borderRadius:3, padding:"1px 7px", fontFamily:"monospace" }}>OCR COMPLETE</span>}
-        {isErr  && <span style={{ fontSize:10, color:"#f87171", background:"#200808", border:"1px solid #991b1b", borderRadius:3, padding:"1px 7px", fontFamily:"monospace" }}>OCR FAILED</span>}
-      </div>
-      {isErr ? (
-        <div style={{ fontSize:11, color:"#7f1d1d" }}>{ocrData.error}</div>
-      ) : (
-        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"4px 12px" }}>
-          {Object.entries(ocrData).filter(([k,v])=>v && k!=="error").map(([k,v])=>(
-            <div key={k}>
-              <div style={{ fontSize:9, color:"#334155", textTransform:"uppercase", letterSpacing:"0.06em" }}>{k.replace(/_/g," ")}</div>
-              <div style={{ fontSize:11, color:"#94a3b8", fontFamily:"monospace" }}>
-                {Array.isArray(v) ? v.join(", ") : String(v)}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function CaseCard({ row, decision, isSelected, onSelect, isProcessing }) {
+function CaseCard({ row, decision, isSelected, onSelect }) {
   const c = DC[decision];
   return (
     <div onClick={onSelect} style={{ padding:"10px 14px", cursor:"pointer", background:isSelected?"#0a1525":"transparent", borderLeft:isSelected?`3px solid ${c.color}`:"3px solid transparent", borderBottom:"1px solid #0d1829", transition:"background 0.1s" }}>
@@ -448,9 +434,7 @@ function CaseCard({ row, decision, isSelected, onSelect, isProcessing }) {
         <span style={{ fontSize:11.5, color:"#e2e8f0", fontWeight:600, fontFamily:"monospace", maxWidth:155, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
           {row.campaign_name||row.campaign||"Campaign"}
         </span>
-        {isProcessing
-          ? <span style={{ fontSize:9, color:"#60a5fa", background:"#0c2040", border:"1px solid #1e4080", borderRadius:3, padding:"1px 7px", fontFamily:"monospace" }}>OCR…</span>
-          : <DPill decision={decision} />}
+        <DPill decision={decision} />
       </div>
       <div style={{ fontSize:10, color:"#374151" }}>{row.category||"—"} · {row.recipient_type||"—"}</div>
     </div>
@@ -468,53 +452,35 @@ const DEMO = [
 
 // ─── Main App ───────────────────────────────────────────────────────────────
 export default function KYCEngine() {
-  const [cases, setCases]         = useState(DEMO);
+  const [cases, setCases]         = useState([]);
   const [ocrStore, setOcrStore]   = useState({});      // { rowIndex: { id_proof, rel_proof } }
-  const [processing, setProcessing] = useState({});   // { rowIndex: true }
-  const [selected, setSelected]   = useState(0);
+  const [selected, setSelected]   = useState(null);
   const [filter, setFilter]       = useState("ALL");
   const [search, setSearch]       = useState("");
   const [isDrag, setIsDrag]       = useState(false);
   const fileRef = useRef();
+  const abortRef = useRef(false);
+  const [isBatchRunning, setIsBatchRunning] = useState(false);
 
-  // Run OCR for a single case — supports comma-separated URLs
-  const runOCR = useCallback(async (row, index) => {
-    setProcessing(p => ({ ...p, [index]: true }));
-    const results = {};
-    const idRaw  = row.id_proof_url || row.id_proof_link || row.id_proof_1_url || "";
-    const relRaw = row.relationship_proof_url || row.relationship_proof_link || row.rel_proof_url || "";
-    const rt = norm(row.recipient_type||"");
-    const isOrg = ORG.includes(rt);
 
-    // Handle multiple comma-separated ID proof URLs
-    const idUrls = splitUrls(idRaw);
-    if (idUrls.length > 0) {
-      const docType = isOrg ? "pan_proof" : "id_proof";
-      const ocrResults = await Promise.all(idUrls.map(u => ocrDocument(u, docType)));
-      results.id_proof = mergeOcrResults(ocrResults);
-      results.id_proof_all = ocrResults; // keep individual results for display
-    }
-
-    // Handle multiple comma-separated relationship proof URLs
-    const relUrls = splitUrls(relRaw);
-    if (relUrls.length > 0) {
-      const ocrResults = await Promise.all(relUrls.map(u => ocrDocument(u, "relationship_proof")));
-      results.rel_proof = mergeOcrResults(ocrResults);
-      results.rel_proof_all = ocrResults;
-    }
-
-    setOcrStore(s => ({ ...s, [index]: results }));
-    setProcessing(p => { const n={...p}; delete n[index]; return n; });
-  }, []);
-
-  // Run OCR for all cases
-  const runAllOCR = useCallback(async () => {
+  // Run checks for all cases with pause support
+  const runAllChecks = useCallback(async () => {
+    abortRef.current = false;
+    setIsBatchRunning(true);
     for (let i = 0; i < cases.length; i++) {
-      const row = cases[i];
-      const hasUrl = row.id_proof_url || row.id_proof_link || row.id_proof_1_url || row.relationship_proof_url || row.relationship_proof_link || row.rel_proof_url;
-      if (hasUrl && !ocrStore[i]) await runOCR(row, i);
+      if (abortRef.current) break;
+      setSelected(i);
+      setOcrStore(s => ({ ...s, [i]: { _checked: true } }));
+      // small delay so UI updates are visible
+      await new Promise(r => setTimeout(r, 80));
     }
-  }, [cases, ocrStore, runOCR]);
+    setIsBatchRunning(false);
+  }, [cases]);
+
+  const pauseChecks = useCallback(() => {
+    abortRef.current = true;
+    setIsBatchRunning(false);
+  }, []);
 
   const handleFile = useCallback((file) => {
     if (!file) return;
@@ -530,7 +496,6 @@ export default function KYCEngine() {
   const processed = cases.map((row, i) => ({
     row, index: i,
     ocr: ocrStore[i] || {},
-    isProcessing: !!processing[i],
     ...runKYC(row, ocrStore[i] || {}),
   }));
 
@@ -609,9 +574,10 @@ export default function KYCEngine() {
               <span key={k} style={{ color:DC[k].color }}>{v} <span style={{ opacity:0.5 }}>{k}</span></span>
             ))}
           </div>
-          <button onClick={runAllOCR} style={{ background:"#0c1e38", border:"1px solid #1a3560", color:"#60a5fa", padding:"4px 12px", borderRadius:4, cursor:"pointer", fontSize:11, fontFamily:"monospace" }}>
-            ⚡ Run OCR All
-          </button>
+          {isBatchRunning
+            ? <button onClick={pauseChecks} style={{ background:"#1c1506", border:"1px solid #78350f", color:"#fbbf24", padding:"4px 12px", borderRadius:4, cursor:"pointer", fontSize:11, fontFamily:"monospace" }}>⏸ Pause</button>
+            : <button onClick={runAllChecks} disabled={cases.length===0} style={{ background:"#0c1e38", border:"1px solid #1a3560", color:cases.length===0?"#1e2d45":"#60a5fa", padding:"4px 12px", borderRadius:4, cursor:cases.length===0?"not-allowed":"pointer", fontSize:11, fontFamily:"monospace" }}>▶ Run Checks</button>
+          }
           <button onClick={downloadSample} style={{ background:"#0e1e30", border:"1px solid #1a2d45", color:"#64748b", padding:"4px 12px", borderRadius:4, cursor:"pointer", fontSize:11, fontFamily:"monospace" }}>
             ↓ Sample CSV
           </button>
@@ -646,9 +612,15 @@ export default function KYCEngine() {
 
           <div style={{ flex:1, overflowY:"auto", position:"relative" }}>
             {filtered.map(({ row, decision, index, isProcessing }) => (
-              <CaseCard key={index} row={row} decision={decision} isSelected={index===selected} onSelect={()=>setSelected(index)} isProcessing={isProcessing} />
+              <CaseCard key={index} row={row} decision={decision} isSelected={index===selected} onSelect={()=>setSelected(index)} />
             ))}
-            {filtered.length===0 && <div style={{ padding:24, textAlign:"center", color:"#1e2d45", fontSize:11 }}>No cases match</div>}
+            {cases.length===0 && (
+              <div style={{ padding:32, textAlign:"center" }}>
+                <div style={{ fontSize:22, marginBottom:10 }}>📂</div>
+                <div style={{ fontSize:11, color:"#1e2d45", lineHeight:1.7 }}>No cases loaded.<br/>Upload a CSV to begin.</div>
+              </div>
+            )}
+            {cases.length>0 && filtered.length===0 && <div style={{ padding:24, textAlign:"center", color:"#1e2d45", fontSize:11 }}>No cases match filter</div>}
             {isDrag && (
               <div style={{ position:"absolute", inset:6, background:"#0c2040cc", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13, color:"#60a5fa", border:"2px dashed #2563eb", borderRadius:6 }}>
                 Drop CSV to load
@@ -698,33 +670,6 @@ export default function KYCEngine() {
                 ):null)}
               </div>
 
-              {/* OCR section */}
-              <div style={{ padding:"12px 24px", borderBottom:"1px solid #0d1829" }}>
-                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8 }}>
-                  <div style={{ fontSize:9.5, color:"#334155", textTransform:"uppercase", letterSpacing:"0.1em", fontWeight:700 }}>Document OCR</div>
-                  <button
-                    onClick={()=>runOCR(selRow.row, selRow.index)}
-                    disabled={selRow.isProcessing}
-                    style={{ background:"#0c1e38", border:"1px solid #1a3560", color: selRow.isProcessing?"#334155":"#60a5fa", padding:"3px 10px", borderRadius:3, cursor: selRow.isProcessing?"not-allowed":"pointer", fontSize:10, fontFamily:"monospace" }}>
-                    {selRow.isProcessing ? "Running OCR…" : "⚡ Run OCR"}
-                  </button>
-                </div>
-                {selRow.isProcessing && (
-                  <div style={{ fontSize:11, color:"#60a5fa", padding:"8px 0", fontFamily:"monospace" }}>
-                    Analysing documents with Claude Vision…
-                  </div>
-                )}
-                {!selRow.isProcessing && Object.keys(selRow.ocr).length===0 && (
-                  <div style={{ fontSize:11, color:"#1e2d45", padding:"4px 0" }}>
-                    {(selRow.row.id_proof_url||selRow.row.id_proof_1_url||selRow.row.relationship_proof_url||selRow.row.rel_proof_url)
-                      ? "Click \"Run OCR\" to extract document details automatically."
-                      : "No document URLs found. Add id_proof_url and/or relationship_proof_url columns. Multiple URLs per cell are supported — separate with commas."}
-                  </div>
-                )}
-                {selRow.ocr.id_proof  && <OcrDocView label={`ID Proof${selRow.ocr.id_proof_all?.length > 1 ? ` (${selRow.ocr.id_proof_all.length} docs merged)` : ""}`} ocrData={selRow.ocr.id_proof} />}
-                {selRow.ocr.rel_proof && <OcrDocView label={`Relationship Proof${selRow.ocr.rel_proof_all?.length > 1 ? ` (${selRow.ocr.rel_proof_all.length} docs merged)` : ""}`} ocrData={selRow.ocr.rel_proof} />}
-              </div>
-
               {/* Checks */}
               <div>
                 <div style={{ padding:"10px 16px 5px", fontSize:9.5, color:"#1e2d45", textTransform:"uppercase", letterSpacing:"0.1em", fontWeight:700 }}>
@@ -747,7 +692,12 @@ export default function KYCEngine() {
             </div>
           </div>
         ) : (
-          <div style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"center", color:"#1e2d45", fontSize:12 }}>Select a case</div>
+          <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", color:"#1e2d45", fontSize:12, gap:10 }}>
+            {cases.length===0
+              ? <><div style={{ fontSize:32 }}>⬆</div><div style={{ fontSize:13, color:"#2d3a50" }}>Upload a CSV to get started</div><div style={{ fontSize:11, color:"#1e2d45", marginTop:4 }}>Click "Upload CSV" in the top right</div></>
+              : <div>Select a case from the list</div>
+            }
+          </div>
         )}
       </div>
     </div>
