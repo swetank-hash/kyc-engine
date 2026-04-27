@@ -98,7 +98,14 @@ async function ocrDocument(url, docType = "id_proof") {
       mimeType = url.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg";
     }
     const buf = await blob.arrayBuffer();
-    base64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+    // chunk-based base64 to avoid call stack overflow on large files
+    const bytes = new Uint8Array(buf);
+    let binary = "";
+    const chunkSize = 8192;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    }
+    base64 = btoa(binary);
   } catch (e) {
     return { error: `Could not fetch document: ${e.message}` };
   }
