@@ -73,6 +73,8 @@ function parseCurrency(raw = "") {
 function parseOcrColumn(raw = "") {
   if (!raw || raw.trim() === "") return null;
 
+  // Strip outer single quotes if present (some CSV exporters wrap in single quotes)
+  raw = raw.trim().replace(/^'+|'+$/g, "").trim();
   // Unescape CSV double-quote escaping ("" → ") if present
   raw = raw.replace(/""/g, '"');
 
@@ -418,7 +420,7 @@ function parseCSV(text) {
     }
     values.push(cur.trim());
     const obj = {};
-    headers.forEach((h,i) => { obj[h] = (values[i]||"").replace(/^"|"$/g,"").replace(/""/g,'"').trim(); });
+    headers.forEach((h,i) => { obj[h] = (values[i]||"").replace(/^"|"$/g,"").replace(/""/g,'"').replace(/^'+|'+$/g,"").trim(); });
     return obj;
   });
 }
