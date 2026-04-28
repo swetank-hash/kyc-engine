@@ -61,54 +61,70 @@ function parseCurrency(raw = "") {
 }
 
 // ─── Parse pre-computed OCR data from CSV column ──────────────────────────
-// The CSV has id_proof_ocr_data and relationship_proof_ocr_data columns
-// Each cell contains one or more JSON objects like:
-// {"name":"Ravi Kumar","side":"front","document_id":"3767 9545 0671","document_type":"Aadhaar Card"}
-// Multiple docs are separated by } , { — we parse all and merge names
+// Handles formats:
+//   Single:   {"name":"Ravi","document_type":"Aadhaar Card","document_id":"1234"}
+//   Multiple: {"name":"Ravi",...} , {"name":null,"side":"back",...}
+//   Array:    [{"name":"Ravi",...},{"name":null,...}]
 
 function parseOcrColumn(raw = "") {
   if (!raw || raw.trim() === "") return null;
-  try {
-    // Split on boundaries between JSON objects: "} ," or "},"  followed by "{"
-    // Wrap in array and parse
-    const cleaned = raw.trim();
-    const asArray = cleaned.startsWith("[") ? cleaned : `[${cleaned}]`;
-    // Fix common issues: trailing commas, unquoted values
-    const fixed = asArray
-      .replace(/,\s*}/g, "}")      // trailing commas in objects
-      .replace(/,\s*]/g, "]");     // trailing commas in arrays
-    const entries = JSON.parse(fixed);
-    if (!Array.isArray(entries) || entries.length === 0) return null;
 
-    // Merge all entries — collect all names, take first non-null for each field
-    const merged = {};
-    const allNames = [];
+  // ── Step 1: extract individual JSON objects using regex ──────────────────
+  // This avoids trying to parse the whole string as JSON at once
+  const objectPattern = /\{[^{}]*\}/g;
+  const rawObjects = raw.match(objectPattern) || [];
 
-    for (const entry of entries) {
-      if (entry.name) allNames.push(entry.name);
-      for (const [k, v] of Object.entries(entry)) {
-        if (v && !merged[k]) merged[k] = v;
-      }
+  if (rawObjects.length === 0) return null;
+
+  const entries = [];
+  for (const objStr of rawObjects) {
+    try {
+      entries.push(JSON.parse(objStr));
+    } catch {
+      // try fixing common issues: single quotes, unquoted nulls
+      try {
+        const fixed = objStr
+          .replace(/'/g, '"')                    // single → double quotes
+          .replace(/:\s*None/g, ': null')       // Python None → null
+          .replace(/:\s*True/g, ': true')       // Python True → true
+          .replace(/:\s*False/g, ': false');    // Python False → false
+        entries.push(JSON.parse(fixed));
+      } catch { /* skip unparseable object */ }
     }
-
-    // Normalise field names to what the KYC engine expects
-    return {
-      full_name:       merged.name || null,
-      document_type:   merged.document_type || null,
-      document_number: merged.document_id || merged.document_number || null,
-      names_found:     [...new Set(allNames.filter(Boolean))],
-      _raw_entries:    entries,
-    };
-  } catch (e) {
-    // Try extracting just names with regex as fallback
-    const names = [];
-    const nameMatches = raw.matchAll(/"name"\s*:\s*"([^"]+)"/g);
-    for (const m of nameMatches) { if (m[1] && m[1] !== "null") names.push(m[1]); }
-    if (names.length > 0) {
-      return { full_name: names[0], names_found: [...new Set(names)], _parse_error: e.message };
-    }
-    return { error: `Could not parse OCR data: ${e.message}` };
   }
+
+  if (entries.length === 0) {
+    // Last resort: regex extract all name values directly
+    const names = [...raw.matchAll(/"name"\s*:\s*"([^"]+)"/g)]
+      .map(m => m[1])
+      .filter(n => n && n !== "null");
+    if (names.length > 0) {
+      return { full_name: names[0], names_found: [...new Set(names)], document_type: null, document_number: null, _raw_entries: [] };
+    }
+    return null;
+  }
+
+  // ── Step 2: merge all entries ────────────────────────────────────────────
+  const allNames = [];
+  const merged = {};
+
+  for (const entry of entries) {
+    // collect all non-null names
+    const n = entry.name || entry.full_name || entry.account_name || null;
+    if (n && n !== "null") allNames.push(n);
+    // take first non-null value for each key
+    for (const [k, v] of Object.entries(entry)) {
+      if (v !== null && v !== undefined && v !== "null" && !merged[k]) merged[k] = v;
+    }
+  }
+
+  return {
+    full_name:       merged.name || merged.full_name || allNames[0] || null,
+    document_type:   merged.document_type || null,
+    document_number: merged.document_id || merged.document_number || null,
+    names_found:     [...new Set(allNames)],
+    _raw_entries:    entries,
+  };
 }
 
 // ─── KYC Engine ────────────────────────────────────────────────────────────
