@@ -406,21 +406,49 @@ function runKYC(row, ocrResults = {}) {
   return { checks, decision };
 }
 
-// ─── CSV Parser ────────────────────────────────────────────────────────────
+// ─── CSV Parser (RFC 4180 compliant) ──────────────────────────────────────
+// Correctly handles: quoted fields, escaped quotes (""), commas inside quotes
 function parseCSV(text) {
   const lines = text.trim().split(/\r?\n/);
   if (lines.length < 2) return [];
   const headers = lines[0].split(",").map(h => h.trim().toLowerCase().replace(/\s+/g,"_").replace(/[^a-z0-9_]/g,""));
-  return lines.slice(1).filter(l=>l.trim()).map(line => {
-    const values = []; let cur = "", inQ = false;
-    for (const ch of line) {
-      if (ch==='"') inQ=!inQ;
-      else if (ch===","&&!inQ) { values.push(cur.trim()); cur=""; }
-      else cur+=ch;
+
+  // Parse a single CSV line respecting RFC 4180 quoting rules
+  function parseLine(line) {
+    const values = [];
+    let i = 0;
+    while (i <= line.length) {
+      if (i === line.length) { values.push(""); break; }
+      if (line[i] === '"') {
+        // Quoted field — read until closing unescaped quote
+        i++; // skip opening quote
+        let val = "";
+        while (i < line.length) {
+          if (line[i] === '"') {
+            if (line[i+1] === '"') { val += '"'; i += 2; } // "" = escaped quote
+            else { i++; break; } // end of quoted field
+          } else {
+            val += line[i++];
+          }
+        }
+        values.push(val);
+        // skip comma after field
+        if (line[i] === ',') i++;
+      } else {
+        // Unquoted field — read until comma
+        let val = "";
+        while (i < line.length && line[i] !== ',') val += line[i++];
+        values.push(val.trim());
+        if (line[i] === ',') i++;
+      }
     }
-    values.push(cur.trim());
+    return values;
+  }
+
+  return lines.slice(1).filter(l=>l.trim()).map(line => {
+    const values = parseLine(line);
     const obj = {};
-    headers.forEach((h,i) => { obj[h] = (values[i]||"").replace(/^"|"$/g,"").replace(/""/g,'"').replace(/^'+|'+$/g,"").trim(); });
+    headers.forEach((h,i) => { obj[h] = (values[i]||"").trim(); });
     return obj;
   });
 }
