@@ -524,7 +524,18 @@ export default function KYCEngine() {
     const r = new FileReader();
     r.onload = e => {
       const rows = parseCSV(e.target.result);
-      if (rows.length) { setCases(rows); setOcrStore({}); setSelected(0); }
+      if (rows.length) {
+        // Debug: log first row's OCR fields to console
+        const first = rows.find(r => r.id_proof_ocr_data);
+        if (first) {
+          console.log("=== OCR DEBUG ===");
+          console.log("raw id_proof_ocr_data:", JSON.stringify(first.id_proof_ocr_data));
+          console.log("first char code:", first.id_proof_ocr_data?.charCodeAt(0));
+          const parsed = parseOcrColumn(first.id_proof_ocr_data);
+          console.log("parsed result:", parsed);
+        }
+        setCases(rows); setOcrStore({}); setSelected(null);
+      }
     };
     r.readAsText(file);
   }, []);
