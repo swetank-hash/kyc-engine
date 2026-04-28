@@ -54,10 +54,14 @@ function normRecipient(r = "") {
 }
 
 // Parse currency field — handles "{inr,other,usd}", "INR", "USD" etc.
+// {inr,other,usd} means campaign accepts multiple currencies — treat as INR
+// Only flag USD if currency is exclusively USD (no INR present)
 function parseCurrency(raw = "") {
   const s = raw.toLowerCase();
-  if (s.includes("usd")) return "USD";
-  return "INR";
+  const hasUSD = s.includes("usd");
+  const hasINR = s.includes("inr") || s.includes("other");
+  if (hasUSD && !hasINR) return "USD"; // exclusively USD
+  return "INR"; // INR or mixed — apply INR rules
 }
 
 // ─── Parse pre-computed OCR data from CSV column ──────────────────────────
@@ -68,6 +72,9 @@ function parseCurrency(raw = "") {
 
 function parseOcrColumn(raw = "") {
   if (!raw || raw.trim() === "") return null;
+
+  // Unescape CSV double-quote escaping ("" → ") if present
+  raw = raw.replace(/""/g, '"');
 
   // ── Step 1: extract individual JSON objects using regex ──────────────────
   // This avoids trying to parse the whole string as JSON at once
@@ -157,6 +164,8 @@ function runKYC(row, ocrResults = {}) {
   if (!row.relationship_proof_url && row.relationship_proof_link) row.relationship_proof_url = row.relationship_proof_link;
   if (!row.account_holder_name && row.name_as_in_bank)    row.account_holder_name = row.name_as_in_bank;
   if (!row.gst_status && row.gstin_valid)                 row.gst_status = row.gstin_valid === "true" || row.gstin_valid === "1" ? "VALID" : (row.gstin_valid || "").toUpperCase();
+  if (!row.relationship_type && row.relationship_with_beneficiary) row.relationship_type = row.relationship_with_beneficiary;
+  if (!row.recipient_name && row.name_as_in_bank)         row.recipient_name = row.name_as_in_bank;
 
   // Use pre-computed OCR data from CSV columns if available
   // Falls back to runtime OCR results (ocrResults) if CSV OCR not present
@@ -206,7 +215,14 @@ function runKYC(row, ocrResults = {}) {
   // 4. Myself — CO name match
   if (rt === "myself") {
     if (coName && (nameUser||nameBank)) {
-      if (fuzzyNameMatch(coName,nameUser)||fuzzyNameMatch(coName,nameBank)) {
+      // co_name may be a username/handle — only flag mismatch if it looks like a real name
+      // A real name has letters and spaces but no digits/underscores dominating
+      const looksLikeName = (s) => /^[a-zA-Z\s\.]{4,}$/.test(s.trim());
+      if (!looksLikeName(coName)) {
+        // co_name is a username/handle — can't reliably match, pass to manual
+        checks.push({ id:"myself", label:"CO Name Match (Myself)", status:"hold", detail:`CO identifier "${coName}" appears to be a username, not a name. Manual verification of account ownership required.` });
+        flag("HOLD");
+      } else if (fuzzyNameMatch(coName,nameUser)||fuzzyNameMatch(coName,nameBank)) {
         checks.push({ id:"myself", label:"CO Name Match (Myself)", status:"pass", detail:`Account holder matches Campaign Organiser "${coName}".` });
       } else {
         checks.push({ id:"myself", label:"CO Name Match (Myself)", status:"reject", detail:`Recipient type is "myself" but account name "${nameUser||nameBank}" doesn't match CO "${coName}".` });
@@ -240,7 +256,10 @@ function runKYC(row, ocrResults = {}) {
         flag("REJECT");
       }
     } else if (idOCR) {
-      checks.push({ id:"id", label:"ID Proof (Individual)", status:"hold", detail:"Could not extract a name from the ID document. Manual review required." });
+      // OCR ran but no name extracted — document may be valid, check doc number at least
+      const docNum = idOCR.document_number || "";
+      checks.push({ id:"id", label:"ID Proof (Individual)", status:"hold",
+        detail:`ID document present${docNum ? ` (${idOCR.document_type||"Doc"}: ${docNum})` : ""} but name could not be extracted. Manual name verification required.` });
       flag("HOLD");
     } else {
       checks.push({ id:"id", label:"ID Proof (Individual)", status:"hold", detail:"ID proof data not available. Manual review required." });
@@ -399,7 +418,7 @@ function parseCSV(text) {
     }
     values.push(cur.trim());
     const obj = {};
-    headers.forEach((h,i) => { obj[h] = (values[i]||"").replace(/^"|"$/g,"").trim(); });
+    headers.forEach((h,i) => { obj[h] = (values[i]||"").replace(/^"|"$/g,"").replace(/""/g,'"').trim(); });
     return obj;
   });
 }
