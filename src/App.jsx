@@ -27,15 +27,19 @@ const CAMPAIGN_ALLOWED = {
   social:                 ["beneficiary","myself","ngo","treating_hospital","vendor"],
   social_entrepreneurship:["beneficiary","myself","ngo","treating_hospital","vendor"],
   media:                  ["beneficiary","myself"],
+  arts_media:             ["beneficiary","myself"],
+  arts_and_media:         ["beneficiary","myself"],
   animals:                ["beneficiary","myself"],
   emergencies:            ["beneficiary","myself","family_member"],
   sports:                 ["beneficiary","myself"],
+  environment:            ["beneficiary","myself","ngo","treating_hospital","vendor"],
+  children:               ["beneficiary","myself","family_member","treating_hospital","vendor"],
   others:                 ["beneficiary","myself","family_member","ngo","treating_hospital","vendor"],
 };
 const INDIV   = ["beneficiary","myself","family_member"];
 const ORG     = ["treating_hospital","vendor","ngo","educational_institute"];
 const REL_REQ = ["family_member","treating_hospital","vendor","ngo","educational_institute"];
-const norm    = s => (s||"").toLowerCase().replace(/[\s\-]+/g,"_").replace(/[^a-z0-9_]/g,"");
+const norm    = s => (s||"").toLowerCase().replace(/\s*&\s*/g,"_and_").replace(/\s*\/\s*/g,"_").replace(/[\s\-]+/g,"_").replace(/[^a-z0-9_]/g,"");
 
 // Normalise recipient type — map aliases to canonical values
 function normRecipient(r = "") {
@@ -151,6 +155,8 @@ function runKYC(row, ocrResults = {}) {
   const nameBank   = (row.name_as_in_bank||"").trim();
   const nameUser   = (row.account_holder_name||row.name_entered_by_user||"").trim();
   const panStatus  = (row.pan_status||"").toUpperCase();
+  // pan_card_number in CSV means PAN was submitted — treat as VALID if present
+  const panNumber  = (row.pan_card_number||"").trim();
   const panName    = (row.pan_name||"").trim();
   const recipName  = (row.recipient_name||"").trim();
   const benefName  = (row.beneficiary_name||"").trim();
@@ -198,6 +204,19 @@ function runKYC(row, ocrResults = {}) {
   } else {
     checks.push({ id:"name", label:"Name Match (Bank vs User)", status:"hold", detail:"Bank name or user-entered name missing. Manual verification required." });
     flag("HOLD");
+  }
+
+  // 2b. Beneficiary name vs bank name (for beneficiary recipient type)
+  // The account must belong to the actual beneficiary
+  if (rt === "beneficiary" && nameBank && benefName) {
+    if (fuzzyNameMatch(nameBank, benefName)) {
+      checks.push({ id:"benef_name", label:"Beneficiary Name vs Bank Account", status:"pass",
+        detail:`Bank account holder "${nameBank}" matches beneficiary "${benefName}".` });
+    } else {
+      checks.push({ id:"benef_name", label:"Beneficiary Name vs Bank Account", status:"reject",
+        detail:`Account holder "${nameBank}" does not match beneficiary "${benefName}". For beneficiary recipient type, the beneficiary's own account must be added.` });
+      flag("REJECT");
+    }
   }
 
   // 3. Recipient Type vs Campaign
@@ -271,42 +290,42 @@ function runKYC(row, ocrResults = {}) {
 
   // 6. PAN — Org
   if (isOrg) {
-    const panUrl = row.pan_url || row.id_proof_url || "";
-    if (!panStatus && !panUrl && !idOCR) {
+    // PAN is considered submitted if: pan_card_number column has value, or pan_status set, or OCR extracted it
+    const panSubmitted = panNumber || panStatus || idOCR?.pan_number;
+    if (!panSubmitted) {
       checks.push({ id:"pan", label:"PAN Verification (Org)", status:"hold", detail:"PAN not submitted. Required for all organisational recipients." });
       flag("HOLD");
-    } else if (idOCR?.pan_number || panStatus) {
-      const extractedPAN = idOCR?.pan_number || "";
-      const pName = idOCR?.full_name || panName;
-      const eff   = panStatus || (extractedPAN ? "EXTRACTED" : "");
-      if (eff && pName && recipName) {
-        if (fuzzyNameMatch(pName, recipName)) {
+    } else if (panStatus === "INVALID") {
+      checks.push({ id:"pan", label:"PAN Verification (Org)", status:"reject", detail:"PAN is INVALID. Provide correct PAN card details." });
+      flag("REJECT");
+    } else {
+      const panNameToUse = idOCR?.full_name || panName;
+      const panNum = idOCR?.pan_number || panNumber;
+      if (panNameToUse && recipName) {
+        if (fuzzyNameMatch(panNameToUse, recipName)) {
           checks.push({ id:"pan", label:"PAN Verification (Org)", status:"pass",
-            detail:`PAN${extractedPAN?` ${extractedPAN}`:""} — name "${pName}" matches recipient "${recipName}".` });
+            detail:`PAN${panNum ? ` (${panNum})` : ""} — name "${panNameToUse}" matches recipient "${recipName}".` });
         } else {
           checks.push({ id:"pan", label:"PAN Verification (Org)", status:"reject",
-            detail:`PAN name "${pName}" doesn't match recipient "${recipName}". Update hospital/vendor name.` });
+            detail:`PAN name "${panNameToUse}" doesn't match recipient "${recipName}". Update hospital/vendor name.` });
           flag("REJECT");
         }
-      } else if (panStatus === "INVALID") {
-        checks.push({ id:"pan", label:"PAN Verification (Org)", status:"reject", detail:"PAN is INVALID. Provide correct PAN card details." });
-        flag("REJECT");
       } else {
-        checks.push({ id:"pan", label:"PAN Verification (Org)", status:"hold", detail:"PAN details partially available. Manual verification required." });
-        flag("HOLD");
+        checks.push({ id:"pan", label:"PAN Verification (Org)", status:"pass",
+          detail:`PAN submitted${panNum ? ` (${panNum})` : ""}. Name verification skipped — no PAN name available for matching.` });
       }
-    } else {
-      checks.push({ id:"pan", label:"PAN Verification (Org)", status:"hold", detail:"PAN document data not available. Manual review required." });
-      flag("HOLD");
     }
   }
 
   // 7. GST — Vendor
+  // gstin_valid column: "true"/"1"/true = valid. Also check gst_status.
+  const gstinValid = (row.gstin_valid||"").toLowerCase();
+  const gstIsValid = gstStatus === "VALID" || gstinValid === "true" || gstinValid === "1";
   if (rt === "vendor") {
-    if (!gstStatus) {
+    if (!gstStatus && !gstinValid) {
       checks.push({ id:"gst", label:"GST Verification (Vendor)", status:"hold", detail:"GST number not submitted. Required for vendor accounts." });
       flag("HOLD");
-    } else if (gstStatus === "VALID") {
+    } else if (gstIsValid) {
       checks.push({ id:"gst", label:"GST Verification (Vendor)", status:"pass", detail:"GST number verified as valid." });
     } else {
       checks.push({ id:"gst", label:"GST Verification (Vendor)", status:"reject", detail:"GST verification failed. Vendor must provide a valid GST invoice." });
