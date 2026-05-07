@@ -35,6 +35,8 @@ const CAMPAIGN_ALLOWED = {
   environment:            ["beneficiary","myself","ngo","treating_hospital","vendor"],
   children:               ["beneficiary","myself","family_member","treating_hospital","vendor"],
   others:                 ["beneficiary","myself","family_member","ngo","treating_hospital","vendor"],
+  livelihood:             ["beneficiary","myself","family_member","ngo","treating_hospital","vendor"],
+  women:                  ["beneficiary","myself","family_member","ngo","treating_hospital","vendor"],
 };
 const INDIV   = ["beneficiary","myself","family_member"];
 const ORG     = ["treating_hospital","vendor","ngo","educational_institute"];
@@ -76,67 +78,57 @@ function parseCurrency(raw = "") {
 
 function parseOcrColumn(raw = "") {
   if (!raw || raw.trim() === "") return null;
+  raw = raw.trim().replace(/^'+|'+$/g, "").trim().replace(/""/g, '"');
 
-  // Strip outer single quotes if present (some CSV exporters wrap in single quotes)
-  raw = raw.trim().replace(/^'+|'+$/g, "").trim();
-  // Unescape CSV double-quote escaping ("" → ") if present
-  raw = raw.replace(/""/g, '"');
-
-  // ── Step 1: extract individual JSON objects using regex ──────────────────
-  // This avoids trying to parse the whole string as JSON at once
-  const objectPattern = /\{[^{}]*\}/g;
-  const rawObjects = raw.match(objectPattern) || [];
-
-  if (rawObjects.length === 0) return null;
-
-  const entries = [];
-  for (const objStr of rawObjects) {
-    try {
-      entries.push(JSON.parse(objStr));
-    } catch {
-      // try fixing common issues: single quotes, unquoted nulls
-      try {
-        const fixed = objStr
-          .replace(/'/g, '"')                    // single → double quotes
-          .replace(/:\s*None/g, ': null')       // Python None → null
-          .replace(/:\s*True/g, ': true')       // Python True → true
-          .replace(/:\s*False/g, ': false');    // Python False → false
-        entries.push(JSON.parse(fixed));
-      } catch { /* skip unparseable object */ }
-    }
-  }
-
-  if (entries.length === 0) {
-    // Last resort: regex extract all name values directly
-    const names = [...raw.matchAll(/"name"\s*:\s*"([^"]+)"/g)]
-      .map(m => m[1])
-      .filter(n => n && n !== "null");
-    if (names.length > 0) {
-      return { full_name: names[0], names_found: [...new Set(names)], document_type: null, document_number: null, _raw_entries: [] };
-    }
-    return null;
-  }
-
-  // ── Step 2: merge all entries ────────────────────────────────────────────
+  // ── Extract ALL name-like values from anywhere in the JSON ───────────────
+  // Handles: flat {"name":"X"}, nested {personal_details:{name:"X"}},
+  // groom_details.name, bride_details.name, family_details[].name etc.
   const allNames = [];
-  const merged = {};
+  const addName = (n) => {
+    if (!n || typeof n !== "string") return;
+    // Strip titles and relationship prefixes
+    const cleaned = n.replace(/^(Sri\.?|Smt\.?|Kum\.?|Mr\.?|Mrs\.?|Dr\.?|S\/O:|W\/O:|D\/O:|B\/O:)\s*/i, "").trim();
+    if (cleaned && cleaned !== "null" && cleaned.length > 1) allNames.push(cleaned);
+  };
 
-  for (const entry of entries) {
-    // collect all non-null names
-    const n = entry.name || entry.full_name || entry.account_name || null;
-    if (n && n !== "null") allNames.push(n);
-    // take first non-null value for each key
-    for (const [k, v] of Object.entries(entry)) {
-      if (v !== null && v !== undefined && v !== "null" && !merged[k]) merged[k] = v;
-    }
+  // Regex: find all "name": "value" or "name_before_marriage": "value" etc.
+  const nameKeys = ["name","name_before_marriage","name_after_marriage","full_name"];
+  for (const key of nameKeys) {
+    const re = new RegExp(`"${key}"\\s*:\\s*"([^"]+)"`, "g");
+    for (const m of raw.matchAll(re)) addName(m[1]);
   }
+
+  // Also extract from family_details array (Jan Aadhaar style)
+  // {"name": "RAMKARAN", "relation_to_head": "Husband"} etc.
+  const familyRe = /"name"\s*:\s*"([^"]+)"/g;
+  for (const m of raw.matchAll(familyRe)) addName(m[1]);
+
+  // Dedupe preserving order
+  const uniqueNames = [...new Map(allNames.map(n => [n.toLowerCase(), n])).values()];
+
+  // ── Try to parse full JSON for structured fields ─────────────────────────
+  let docType = null, docNumber = null;
+  try {
+    // Try parsing as a single JSON object (new rich OCR format)
+    const obj = JSON.parse(raw);
+    docType = obj.document_type || null;
+    docNumber = obj.personal_details?.aadhaar_number || obj.registration_no || null;
+  } catch {
+    // Fallback: extract doc_type from any "document_type" field
+    const dtm = raw.match(/"document_type"\s*:\s*"([^"]+)"/);
+    if (dtm) docType = dtm[1];
+    const dnm = raw.match(/"document_id"\s*:\s*"([^"]+)"/);
+    if (dnm) docNumber = dnm[1];
+  }
+
+  if (uniqueNames.length === 0 && !docType) return null;
 
   return {
-    full_name:       merged.name || merged.full_name || allNames[0] || null,
-    document_type:   merged.document_type || null,
-    document_number: merged.document_id || merged.document_number || null,
-    names_found:     [...new Set(allNames)],
-    _raw_entries:    entries,
+    full_name:       uniqueNames[0] || null,
+    document_type:   docType,
+    document_number: docNumber,
+    names_found:     uniqueNames,
+    _raw_entries:    [],
   };
 }
 
@@ -343,18 +335,32 @@ function runKYC(row, ocrResults = {}) {
       checks.push({ id:"rel", label:"Relationship Proof", status:"hold", detail:`Relationship proof error: ${relOCR.error}. Manual review required.` });
       flag("HOLD");
     } else if (relOCR?.names_found) {
-      const names   = relOCR.names_found || [];
+      const names = relOCR.names_found || [];
+
+      // Exact fuzzy match
       const hasBenef = benefName && names.some(n => fuzzyNameMatch(n, benefName));
       const hasRecip = recipName && names.some(n => fuzzyNameMatch(n, recipName));
-      if (hasBenef && hasRecip) {
+
+      // Partial match — any significant word from the name appears in any extracted name
+      // Handles "Sneha S" matching "Smt. Sneha S", "Chandra Prakash" in family list etc.
+      const partialMatch = (target, nameList) => {
+        if (!target) return false;
+        const words = target.toLowerCase().split(" ").filter(w => w.length > 2);
+        return nameList.some(n => words.some(w => n.toLowerCase().includes(w)));
+      };
+
+      const benefConfirmed = hasBenef || partialMatch(benefName, names);
+      const recipConfirmed = hasRecip || partialMatch(recipName, names);
+
+      if (benefConfirmed && recipConfirmed) {
         checks.push({ id:"rel", label:"Relationship Proof", status:"pass",
-          detail:`${relOCR.document_type||"Document"} — both "${benefName}" (beneficiary) and "${recipName}" (recipient) found in document. Relationship established.` });
-      } else if (!hasBenef && !hasRecip) {
+          detail:`${relOCR.document_type||"Document"} — both "${benefName}" and "${recipName}" confirmed. Relationship established.` });
+      } else if (!benefConfirmed && !recipConfirmed) {
         checks.push({ id:"rel", label:"Relationship Proof", status:"reject",
-          detail:`Neither beneficiary "${benefName}" nor recipient "${recipName}" found in relationship document. Names found: ${names.join(", ")||"none"}. Provide a valid document.` });
+          detail:`Neither beneficiary "${benefName}" nor recipient "${recipName}" found in document. Names found: ${names.join(", ")||"none"}.` });
         flag("REJECT");
       } else {
-        const missing = !hasBenef ? `beneficiary "${benefName}"` : `recipient "${recipName}"`;
+        const missing = !benefConfirmed ? `beneficiary "${benefName}"` : `recipient "${recipName}"`;
         checks.push({ id:"rel", label:"Relationship Proof", status:"reject",
           detail:`Could not confirm ${missing} in relationship document. Names found: ${names.join(", ")||"none"}.` });
         flag("REJECT");
@@ -425,51 +431,70 @@ function runKYC(row, ocrResults = {}) {
   return { checks, decision };
 }
 
-// ─── CSV Parser (RFC 4180 compliant) ──────────────────────────────────────
-// Correctly handles: quoted fields, escaped quotes (""), commas inside quotes
+// ─── CSV Parser (RFC 4180 compliant — handles multi-line quoted fields) ───
+// Multi-line JSON in cells (e.g. relationship_proof_ocr_data) is handled correctly
 function parseCSV(text) {
-  const lines = text.trim().split(/\r?\n/);
-  if (lines.length < 2) return [];
-  const headers = lines[0].split(",").map(h => h.trim().toLowerCase().replace(/\s+/g,"_").replace(/[^a-z0-9_]/g,""));
+  // Normalize line endings
+  const raw = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 
-  // Parse a single CSV line respecting RFC 4180 quoting rules
-  function parseLine(line) {
-    const values = [];
+  // Parse entire file character-by-character so multi-line fields work
+  function parseAll(str) {
+    const rows = [];
     let i = 0;
-    while (i <= line.length) {
-      if (i === line.length) { values.push(""); break; }
-      if (line[i] === '"') {
-        // Quoted field — read until closing unescaped quote
-        i++; // skip opening quote
-        let val = "";
-        while (i < line.length) {
-          if (line[i] === '"') {
-            if (line[i+1] === '"') { val += '"'; i += 2; } // "" = escaped quote
-            else { i++; break; } // end of quoted field
-          } else {
-            val += line[i++];
+    while (i < str.length) {
+      const row = [];
+      // Parse one row (may span multiple lines if fields are quoted)
+      while (i <= str.length) {
+        if (i === str.length) { row.push(""); break; }
+        if (str[i] === '"') {
+          // Quoted field
+          i++; let val = "";
+          while (i < str.length) {
+            if (str[i] === '"') {
+              if (str[i+1] === '"') { val += '"'; i += 2; } // escaped quote
+              else { i++; break; }                           // end of field
+            } else {
+              val += str[i++];
+            }
           }
+          row.push(val);
+          if (str[i] === ',') i++;
+          else break; // end of row (newline or EOF)
+        } else {
+          // Unquoted field
+          let val = "";
+          while (i < str.length && str[i] !== ',' && str[i] !== '\n') val += str[i++];
+          row.push(val.trim());
+          if (str[i] === ',') i++;
+          else { i++; break; } // newline = end of row
         }
-        values.push(val);
-        // skip comma after field
-        if (line[i] === ',') i++;
-      } else {
-        // Unquoted field — read until comma
-        let val = "";
-        while (i < line.length && line[i] !== ',') val += line[i++];
-        values.push(val.trim());
-        if (line[i] === ',') i++;
       }
+      if (row.length > 1 || (row.length === 1 && row[0] !== "")) rows.push(row);
     }
-    return values;
+    return rows;
   }
 
-  return lines.slice(1).filter(l=>l.trim()).map(line => {
-    const values = parseLine(line);
-    const obj = {};
-    headers.forEach((h,i) => { obj[h] = (values[i]||"").trim(); });
-    return obj;
-  });
+  const rows = parseAll(raw);
+  if (rows.length < 2) return [];
+
+  const headers = rows[0].map(h => h.trim().toLowerCase().replace(/\s+/g,"_").replace(/[^a-z0-9_]/g,""));
+
+  return rows.slice(1)
+    .filter(vals => vals.some(v => v.trim() !== ""))  // skip fully empty rows
+    .filter(vals => {
+      // Skip rows that are clearly not real data records
+      // A real record must have at least a project_id-like value or campaign_name
+      const campaignIdx = headers.indexOf("campaign_name");
+      const projectIdx = headers.indexOf("project_id");
+      if (campaignIdx >= 0 && vals[campaignIdx] && vals[campaignIdx].includes("support-")) return true;
+      if (projectIdx >= 0 && vals[projectIdx] && /^\d+$/.test(vals[projectIdx])) return true;
+      return false;
+    })
+    .map(vals => {
+      const obj = {};
+      headers.forEach((h, i) => { obj[h] = (vals[i] || "").trim(); });
+      return obj;
+    });
 }
 
 // ─── Design tokens ─────────────────────────────────────────────────────────
